@@ -78,13 +78,41 @@ const TABLE_SCHEMAS = {
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     `,
-    wheel_deposits: `
-        CREATE TABLE IF NOT EXISTS wheel_deposits (
+    payments_log: `
+        CREATE TABLE IF NOT EXISTS payments_log (
             id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
+            payment_id VARCHAR(50) UNIQUE,
+            user_id VARCHAR(50) NOT NULL,
+            user_username VARCHAR(100),
+            user_full_name VARCHAR(200),
             amount DECIMAL(20,2) NOT NULL,
-            deposit_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            source VARCHAR(100)
+            method VARCHAR(50) NOT NULL,
+            method_type VARCHAR(20) DEFAULT 'auto',
+            transaction_id VARCHAR(100),
+            bonus_amount DECIMAL(20,2) DEFAULT 0,
+            bonus_percent DECIMAL(5,2) DEFAULT 0,
+            final_amount DECIMAL(20,2) NOT NULL,
+            old_balance DECIMAL(20,2) DEFAULT 0,
+            new_balance DECIMAL(20,2) DEFAULT 0,
+            exchange_rate DECIMAL(10,4) DEFAULT 1.0,
+            commission_amount DECIMAL(20,2) DEFAULT 0,
+            referrer_id VARCHAR(50),
+            ichancy_username VARCHAR(100),
+            ichancy_player_id VARCHAR(50),
+            status VARCHAR(20) DEFAULT 'completed',
+            payment_time TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            log_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    `,
+    payments_stats: `
+        CREATE TABLE IF NOT EXISTS payments_stats (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(50) UNIQUE,
+            total_payments INTEGER DEFAULT 0,
+            total_amount DECIMAL(20,2) DEFAULT 0,
+            last_payment_time TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     `,
     wheel_banner: `
@@ -707,7 +735,6 @@ app.post('/api/admin/reset-spins', async (req, res) => {
         let deletedCount;
         
         if (user_id) {
-            // حذف تدويرات مستخدم محدد
             const result = await pool.query(
                 'DELETE FROM wheel_spins WHERE user_id = $1 RETURNING id',
                 [user_id]
@@ -715,13 +742,11 @@ app.post('/api/admin/reset-spins', async (req, res) => {
             deletedCount = result.rowCount;
             console.log(`🗑️ Deleted ${deletedCount} spins for user ${user_id}`);
         } else {
-            // حذف جميع التدويرات
             const result = await pool.query('DELETE FROM wheel_spins RETURNING id');
             deletedCount = result.rowCount;
             console.log(`🗑️ Deleted ${deletedCount} spins for all users`);
         }
 
-        // إعادة تعيين التسلسل (sequence)
         await pool.query('ALTER SEQUENCE wheel_spins_id_seq RESTART WITH 1');
 
         res.json({
@@ -794,10 +819,10 @@ app.post('/api/wheel/spin', async (req, res) => {
 
             const userDeposits = await pool.query(`
                 SELECT COALESCE(SUM(final_amount), 0) as total
-                FROM external_deposits
+                FROM payments_log
                 WHERE user_id = $1 
                 AND status = 'completed'
-                AND created_at >= NOW() - INTERVAL '${checkHoursValue} hours'
+                AND payment_time >= NOW() - INTERVAL '${checkHoursValue} hours'
             `, [user_id]);
 
             const totalDeposits = parseFloat(userDeposits.rows[0]?.total || 0);
@@ -815,14 +840,13 @@ app.post('/api/wheel/spin', async (req, res) => {
             }
         }
 
-        // 3. التحقق من آخر تدوير (من قاعدة البيانات مباشرة)
+        // 3. التحقق من آخر تدوير
         const intervalHours = await pool.query(
             'SELECT setting_value FROM wheel_settings WHERE setting_key = $1',
             ['spin_interval_hours']
         );
         const intervalHoursValue = parseInt(intervalHours.rows[0]?.setting_value || 24);
 
-        // ✅ استعلام مباشر من قاعدة البيانات - بدون كاش
         const lastSpin = await pool.query(`
             SELECT spin_date FROM wheel_spins 
             WHERE user_id = $1 
@@ -879,7 +903,7 @@ app.post('/api/wheel/spin', async (req, res) => {
 
         console.log(`🎯 Selected prize: ${selectedPrize.name} (${selectedPrize.probability}%)`);
 
-        // 5. تسجيل التدوير في قاعدة البيانات
+        // 5. تسجيل التدوير
         const result = await pool.query(`
             INSERT INTO wheel_spins (user_id, prize_id, prize_name, is_claimed)
             VALUES ($1, $2, $3, FALSE)
@@ -931,7 +955,6 @@ app.get('/api/wheel/history/:user_id', async (req, res) => {
     }
 
     try {
-        // ✅ استعلام مباشر من قاعدة البيانات - بدون كاش
         const lastSpin = await pool.query(`
             SELECT spin_date FROM wheel_spins 
             WHERE user_id = $1 
@@ -966,10 +989,10 @@ app.get('/api/wheel/history/:user_id', async (req, res) => {
 
             const userDeposits = await pool.query(`
                 SELECT COALESCE(SUM(final_amount), 0) as total
-                FROM external_deposits
+                FROM payments_log
                 WHERE user_id = $1 
                 AND status = 'completed'
-                AND created_at >= NOW() - INTERVAL '${checkHoursValue} hours'
+                AND payment_time >= NOW() - INTERVAL '${checkHoursValue} hours'
             `, [user_id]);
 
             depositInfo = {
@@ -1033,45 +1056,6 @@ app.get('/api/wheel/history/:user_id', async (req, res) => {
     }
 });
 
-// -------------------- تسجيل إيداع --------------------
-app.post('/api/wheel/deposit', async (req, res) => {
-    const { user_id, amount, source } = req.body;
-
-    if (!user_id || !amount) {
-        return res.status(400).json({
-            success: false,
-            error: 'user_id and amount are required'
-        });
-    }
-
-    if (!dbReady) {
-        return res.status(503).json({
-            success: false,
-            error: 'Database is not ready.'
-        });
-    }
-
-    try {
-        await pool.query(`
-            INSERT INTO external_deposits (user_id, amount_sent, final_amount, method_name, status, notes)
-            VALUES ($1, $2, $3, 'يدوي', 'completed', $4)
-        `, [user_id, amount, amount, source || 'wheel_deposit']);
-
-        console.log(`💰 Deposit recorded: ${user_id} - ${amount} SYP`);
-
-        res.json({
-            success: true,
-            message: '✅ تم تسجيل الإيداع بنجاح'
-        });
-    } catch (error) {
-        console.error('Deposit error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // ================================================================
 //                      تشغيل الخادم
 // ================================================================
@@ -1096,3 +1080,5 @@ startServer().catch(err => {
     console.error('❌ فشل تشغيل الخادم:', err);
     process.exit(1);
 });
+
+
